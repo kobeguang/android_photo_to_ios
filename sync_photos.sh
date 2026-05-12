@@ -15,69 +15,114 @@ REMOTE_DIRS=("/sdcard/DCIM/Camera/" "/sdcard/DCIM/Screenshots/")
 # 本地临时缓存目录与同步记录日志
 LOCAL_TEMP_DIR="/tmp/samsung_photos_sync/"
 LOG_FILE="$HOME/Scripts/synced_photos.log"
+CACHE_FILE="$HOME/Scripts/.android_ip_cache"
 
 # 初始化本地环境
 mkdir -p "$LOCAL_TEMP_DIR"
 touch "$LOG_FILE"
+touch "$CACHE_FILE"
 
 echo "=== 开始执行 Android to iOS 照片无感同步流水线 ==="
-echo "🔍 正在扫描当前局域网寻找开放了 $PHONE_PORT 端口的设备..."
 
 ACTIVE_IP=""
 
 # ==========================================
-# --- 阶段一：动态端口嗅探与设备发现 ---
+# --- 阶段一：动态端口嗅探与智能缓存路由 ---
 # ==========================================
 
-# 1. 获取 Mac 当前连接网卡的广播地址 (以 en0 为例)
-BROADCAST_IP=$(ifconfig en0 | grep broadcast | awk '{print $6}')
-
-if [[ -n "$BROADCAST_IP" ]]; then
-    # 2. 发送两组 Ping 广播包，强制局域网内设备暴露自己，刷新 Mac 的 ARP 缓存表
-    ping -c 2 -t 1 "$BROADCAST_IP" >/dev/null 2>&1
+# 1. 动态获取当前激活的网卡和网段
+DEFAULT_IF=$(route -n get default 2>/dev/null | awk '/interface: / {print $2}')
+if [[ -z "$DEFAULT_IF" ]]; then
+    echo "❌ 错误: 未检测到活动的网络连接。"
+    exit 1
 fi
 
-# 3. 从 ARP 表中提取出所有存活设备的 IP 地址 (去重)
-ARP_IPS=$(arp -a | grep -Eo '[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}' | sort -u)
+MY_IP=$(ifconfig "$DEFAULT_IF" | awk '/inet / {print $2}')
+CURRENT_SUBNET=$(echo "$MY_IP" | awk -F. '{print $1"."$2"."$3}')
 
-# 4. 并发/轮询探测这些 IP 的 5566 端口
-while IFS= read -r ip; do
-    if [[ -z "$ip" ]]; then continue; fi
+echo "🌐 当前所在网段: $CURRENT_SUBNET.x"
 
-    # 使用 macOS 自带的 netcat (nc) 探测端口
-    if nc -z -G 1 "$ip" "$PHONE_PORT" 2>/dev/null; then
-        echo "⚡️ 嗅探到目标: $ip 的 $PHONE_PORT 端口处于开放状态！"
+# 2. 尝试命中缓存 (Cache Hit)
+CACHED_IP=$(grep "^${CURRENT_SUBNET}=" "$CACHE_FILE" | cut -d= -f2)
 
-        # 尝试通过 ADB 进行握手
-        $ADB_PATH connect "$ip:$PHONE_PORT" >/dev/null 2>&1
-        sleep 1
-
-        # 验证是否真正握手成功
-        DEVICES=$($ADB_PATH devices)
-        if echo "$DEVICES" | grep -q "$ip:$PHONE_PORT" && ! echo "$DEVICES" | grep "$ip:$PHONE_PORT" | grep -q "offline"; then
-            echo "✅ 成功接头！设备真实 IP 为: $ip"
-            ACTIVE_IP=$ip
-            break
-        else
-            # 握手失败，清理死连接
-            $ADB_PATH disconnect "$ip:$PHONE_PORT" >/dev/null 2>&1
-        fi
+if [[ -n "$CACHED_IP" ]]; then
+    echo "💡 发现该网段的缓存 IP: $CACHED_IP，正在尝试快速探测..."
+    # 【修复1】: macOS 必须用 -G 1 才能真正限制 TCP 连接超时为 1 秒
+    if nc -z -G 1 "$CACHED_IP" "$PHONE_PORT" >/dev/null 2>&1; then
+        echo "✅ 缓存命中！手机已就绪。"
+        ACTIVE_IP="$CACHED_IP"
+    else
+        echo "⚠️ 缓存失效 (IP 可能已重新分配或服务未启动)，降级进入全网扫描..."
     fi
-done <<< "$ARP_IPS"
+fi
+
+# 3. 缓存未命中或失效，执行全网段并发扫描 (Cache Miss)
+if [[ -z "$ACTIVE_IP" ]]; then
+    echo "🔍 启动全网段并发探测 (预计 1-2 秒内完成)..."
+    
+    BROADCAST_IP=$(ifconfig "$DEFAULT_IF" | grep broadcast | awk '{print $6}')
+    if [[ -n "$BROADCAST_IP" ]]; then
+        # 强制局域网内设备暴露自己，刷新 Mac 的 ARP 缓存表
+        ping -c 2 -t 1 "$BROADCAST_IP" >/dev/null 2>&1
+    fi
+    
+    # 提取 ARP 表中同网段的有效 IP
+    ARP_IPS=$(arp -a | grep "($CURRENT_SUBNET." | awk -F '[()]' '{print $2}')
+    
+    # 使用临时文件跨子进程传递找到的 IP
+    TMP_IP_FILE="$LOCAL_TEMP_DIR/found_ip.tmp"
+    rm -f "$TMP_IP_FILE"
+    
+    # 【修复2】: 核心并发扫描引擎！将所有 nc 探测放入后台 (&) 同步执行
+    for IP in $ARP_IPS; do
+        (
+            if nc -z -G 1 "$IP" "$PHONE_PORT" >/dev/null 2>&1; then
+                echo "$IP" > "$TMP_IP_FILE"
+            fi
+        ) &
+    done
+    
+    # 等待所有并发的后台探针任务结束 (因为加了 -G 1，最多只会等 1 秒)
+    wait
+    
+    # 检查是否有探针成功返回了 IP
+    if [[ -f "$TMP_IP_FILE" ]]; then
+        ACTIVE_IP=$(head -n 1 "$TMP_IP_FILE")
+        rm -f "$TMP_IP_FILE"
+        
+        echo "✅ 寻址成功：找到设备 $ACTIVE_IP"
+        
+        # 【回写缓存】: 删除当前网段的旧记录，写入新记录
+        sed -i '' "/^${CURRENT_SUBNET}=/d" "$CACHE_FILE"
+        echo "${CURRENT_SUBNET}=${ACTIVE_IP}" >> "$CACHE_FILE"
+        echo "💾 已将该 IP 写入本地缓存，下次执行将直接秒连。"
+    fi
+fi
 
 if [[ -z "$ACTIVE_IP" ]]; then
-    echo "❌ 扫描完毕，当前局域网内未发现开放 $PHONE_PORT 端口的 Android 设备。设备可能休眠或不在同一网络。"
-    exit 0
+    echo "❌ 扫描结束，未在局域网内找到开放 $PHONE_PORT 端口的设备。"
+    exit 1
 fi
 
 # ==========================================
-# --- 阶段二：增量同步与相册导入 ---
+# --- 阶段二：建立连接与增量拉取 ---
 # ==========================================
+echo "🔗 正在连接设备 $ACTIVE_IP:$PHONE_PORT..."
+$ADB_PATH connect "$ACTIVE_IP:$PHONE_PORT" >/dev/null 2>&1
+
+# 检查连接是否成功
+ADB_STATE=$($ADB_PATH devices | grep "$ACTIVE_IP:$PHONE_PORT" | awk '{print $2}')
+if [[ "$ADB_STATE" != "device" ]]; then
+    echo "❌ 连接失败，请检查手机是否开启了端口为 $PHONE_PORT 的无线调试或 ADB tcpip。"
+    exit 1
+fi
+
+echo "✅ 设备连接成功，准备同步照片..."
 
 for REMOTE_DIR in "${REMOTE_DIRS[@]}"; do
-    echo "\n📂 正在扫描目录: $REMOTE_DIR"
+    echo "📂 正在检查目录: $REMOTE_DIR"
     
-    # 获取远程文件列表 (排除文件夹，只留文件，并清除换行回车符)
+    # 列出远程目录下的所有文件 (排除子目录)
     REMOTE_FILES=$($ADB_PATH shell ls -p "$REMOTE_DIR" | grep -v / | tr -d '\r')
     
     if [[ -z "$REMOTE_FILES" ]]; then
@@ -114,15 +159,12 @@ for REMOTE_DIR in "${REMOTE_DIRS[@]}"; do
     done
     
     if [[ $SYNC_COUNT -eq 0 ]]; then
-        echo "  -> 没有新照片需要同步。"
+        echo "  -> 没有发现新照片。"
     else
-        echo "  -> 🎉 本目录成功同步了 $SYNC_COUNT 张新照片。"
+        echo "  -> 🎉 本次成功同步 $SYNC_COUNT 张照片。"
     fi
 done
 
-# ==========================================
-# --- 收尾清理 ---
-# ==========================================
-echo "\n✅ 当前环境所有照片同步流水线执行完毕！"
-# 断开无线连接，保持后台纯净
+# 断开连接 (保持整洁)
 $ADB_PATH disconnect "$ACTIVE_IP:$PHONE_PORT" >/dev/null 2>&1
+echo "=== 同步任务结束 ==="
